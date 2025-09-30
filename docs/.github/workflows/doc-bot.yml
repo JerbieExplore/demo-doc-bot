@@ -1,0 +1,87 @@
+name: Doc Bot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  doc-bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate diff
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git diff --unified=0 origin/${{ github.event.pull_request.base.ref }}...HEAD -- . > diff.patch
+
+      - name: Run generator (diff → business summary)
+        run: |
+          python3 scripts/generate_business_update.py \
+            --diff-file diff.patch \
+            --business-md docs/business_updates.md \
+            --proposals_json docs/proposals.json \
+            --pr_url "${{ github.event.pull_request.html_url }}" \
+            --pr_number "${{ github.event.number }}" \
+            --pr_comment_out pr_comment.md
+
+      - name: Create docs branch & commit changes
+        id: commitdocs
+        run: |
+          BR="docs/update-${{ github.run_id }}"
+          git checkout -b "$BR"
+          git add docs/business_updates.md docs/proposals.json
+          git -c user.name="doc-bot" -c user.email="bot@example.com" commit -m "docs: auto-update from PR #${{ github.event.number }}" || echo "nothing to commit"
+          echo "branch=$BR" >> $GITHUB_OUTPUT
+          git push -u origin "$BR" || true
+
+      - name: Open docs PR
+        id: opendocspr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: ${{ steps.commitdocs.outputs.branch }}
+          title: "docs: business update from PR #${{ github.event.number }}"
+          body: "Automated docs update based on code diff."
+          commit-message: "docs: auto-update"
+          labels: automated, docs
+
+      - name: Add Docs PR URL into proposals.json (so Lovable can link it)
+        if: ${{ steps.opendocspr.outputs.pull-request-url }}
+        run: |
+          PRURL="${{ steps.opendocspr.outputs.pull-request-url }}"
+          python3 - <<'PY'
+import json
+p="docs/proposals.json"
+with open(p,"r",encoding="utf-8") as f:
+    arr=json.load(f)
+if arr:
+    arr[-1]["docs_pr_html_url"] = "${PRURL}"
+with open(p,"w",encoding="utf-8") as f:
+    json.dump(arr,f,indent=2,ensure_ascii=False)
+PY
+          git add docs/proposals.json
+          git -c user.name="doc-bot" -c user.email="bot@example.com" commit -m "chore: link docs PR in proposals" || true
+          git push || true
+
+      - name: Comment on original PR (links to Docs PR + Dashboard)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const docsPr = `${{ steps.opendocspr.outputs.pull-request-url || 'Docs PR pending' }}`;
+            const dashboard = `https://${context.repo.owner}.github.io/${context.repo.repo}/dashboard.html`;
+            const fs = require('fs');
+            let body = fs.readFileSync('pr_comment.md','utf8');
+            body += `\n\n**Docs PR:** ${docsPr}\n**Dashboard:** ${dashboard}\n`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
